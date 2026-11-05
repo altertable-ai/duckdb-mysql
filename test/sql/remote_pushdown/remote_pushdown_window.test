@@ -47,7 +47,21 @@ SELECT i, g, DENSE_RANK() OVER (PARTITION BY g ORDER BY i) AS dr FROM s.win_tbl 
 7	1	3
 8	2	3
 
-# LAG / LEAD
+# LAG / LEAD 2 arg
+query II
+SELECT i, COALESCE(LAG(v, 1) OVER (ORDER BY i), -1) AS prev FROM s.win_tbl ORDER BY i
+----
+0	-1
+1	0
+2	10
+3	20
+4	30
+5	40
+6	50
+7	60
+8	70
+
+# LAG / LEAD 3 arg - pushed down to MySQL only
 query II
 SELECT i, LAG(v, 1, -1) OVER (ORDER BY i) AS prev FROM s.win_tbl ORDER BY i
 ----
@@ -97,7 +111,7 @@ explain SELECT SUM(filled) FROM (
     SELECT fill(v) OVER (ORDER BY i) AS filled FROM s.null_win_tbl
 ) t
 ----
-physical_plan	<REGEX>:.*WINDOW.*
+physical_plan	<REGEX>:.*Window.*
 
 # mode() used as a window aggregate -- not available in MySQL
 # running mode of g (=i%3) over increasing window; simplest check: count returns correct rows
@@ -113,7 +127,7 @@ explain SELECT COUNT(*) FROM (
     SELECT mode(g) OVER (PARTITION BY g) AS m FROM s.win_tbl
 ) t
 ----
-physical_plan	<REGEX>:.*WINDOW.*
+physical_plan	<REGEX>:.*Aggregates: count_star().*
 
 # IGNORE NULLS on LEAD/LAG -- MySQL cannot parse this syntax
 # if pushed the query would fail with a syntax error
@@ -130,7 +144,7 @@ explain SELECT SUM(nxt) FROM (
     SELECT LEAD(v IGNORE NULLS) OVER (ORDER BY i) AS nxt FROM s.null_win_tbl
 ) t
 ----
-physical_plan	<REGEX>:.*WINDOW.*
+physical_plan	<REGEX>:.*Window.*
 
 # ---- lead/lag with negative or non-literal offsets cannot be pushed (MySQL requires
 # ---- a literal non-negative offset) ----
@@ -142,12 +156,12 @@ SELECT COUNT(*) FROM (SELECT LEAD(v, -1) OVER (ORDER BY i) AS prev FROM s.win_tb
 query II
 explain SELECT LEAD(v, -1) OVER (ORDER BY i) FROM s.win_tbl
 ----
-physical_plan	<REGEX>:.*WINDOW.*
+physical_plan	<REGEX>:.*Window.*
 
 query II
 explain SELECT LEAD(v, i) OVER (ORDER BY i) FROM s.win_tbl
 ----
-physical_plan	<REGEX>:.*WINDOW.*
+physical_plan	<REGEX>:.*Window.*
 
 # literal non-negative offsets are pushed
 query II

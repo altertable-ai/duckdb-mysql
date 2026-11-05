@@ -1,17 +1,17 @@
 #define DUCKDB_BUILD_LOADABLE_EXTENSION
-#include "duckdb.hpp"
-
-#include "mysql_connection_pool.hpp"
-#include "mysql_scanner.hpp"
-#include "mysql_storage.hpp"
 #include "mysql_scanner_extension.hpp"
 
+#include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
-#include "storage/mysql_catalog.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+
+#include "mysql_scanner.hpp"
+#include "mysql_storage.hpp"
+#include "storage/mysql_connection_pool.hpp"
 #include "storage/mysql_optimizer.hpp"
 
 using namespace duckdb;
@@ -48,13 +48,6 @@ static void ValidatePoolAcquireMode(ClientContext &context, SetScope scope, Valu
 				    "mysql_pool_acquire_mode='%s' requires mysql_pool_size > 0 (pooling enabled)", mode);
 			}
 		}
-	}
-}
-
-static void ValidateUnitInterval(ClientContext &context, SetScope scope, Value &parameter) {
-	auto val = parameter.GetValue<double>();
-	if (val < 0.0 || val > 1.0) {
-		throw InvalidInputException("Value must be between 0.0 and 1.0, got %f", val);
 	}
 }
 
@@ -131,11 +124,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	MySQLQueryFunction query_function;
 	loader.RegisterFunction(query_function);
 
-	MySQLExplainFederatedFunction explain_federated_function;
-	loader.RegisterFunction(explain_federated_function);
+	MySQLPinConnectionFunction pin_connection_function;
+	loader.RegisterFunction(pin_connection_function);
 
-	MySQLDebugExecutionPlanFunction debug_plan_function;
-	loader.RegisterFunction(debug_plan_function);
+	MySQLClosePinnedConnectionFunction close_pinned_connection_function;
+	loader.RegisterFunction(close_pinned_connection_function);
+
+	MySQLCreateParamsFunction create_params_function;
+	loader.RegisterFunction(create_params_function);
+
+	MySQLBindParamsFunction bind_params_function;
+	loader.RegisterFunction(bind_params_function);
+
+	MySQLConfigurePoolFunction configure_pool_function;
+	loader.RegisterFunction(configure_pool_function);
 
 	SecretType secret_type;
 	secret_type.name = "mysql";
@@ -154,12 +156,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(db);
 	StorageExtension::Register(config, "mysql_scanner", make_shared_ptr<MySQLStorageExtension>());
 
-	config.AddExtensionOption("mysql_enable_filter_pushdown",
-	                          "Whether or not to use filter pushdown (without predicate analyzer)",
+	config.AddExtensionOption("mysql_enable_filter_pushdown", "Whether or not to use filter pushdown",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("mysql_enable_predicate_analyzer",
-	                          "Whether or not to use predicate analyzer with cost-based pushdowns",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("mysql_enable_remote_pushdown", "Whether or not to use remote pushdown ",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("mysql_debug_show_queries", "DEBUG SETTING: print all queries sent to MySQL to stdout",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetMySQLDebugQueryPrint);
 	config.AddExtensionOption("mysql_tinyint1_as_boolean", "Whether or not to convert TINYINT(1) columns to BOOLEAN",
@@ -182,76 +182,44 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption(
 	    "mysql_pool_size",
 	    "Maximum number of connections per MySQL catalog (default: min(cpu_count, 4 <= cpu_count * 1.5 <= 32))",
-	    LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections), ValidatePoolSize);
+	    LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections), ValidatePoolSize, SetScope::GLOBAL);
 	config.AddExtensionOption("mysql_pool_wait_timeout_millis",
 	                          "Timeout in milliseconds when waiting for a connection from the pool (default: 30000)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.wait_timeout_millis));
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.wait_timeout_millis), nullptr,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption("mysql_pool_connection_max_lifetime_millis",
 	                          "Maximum age in milliseconds of a pooled connection since it was first opened. When "
 	                          "exceeded, the connection is closed instead of being returned to the cache (default: 0 - "
 	                          "disabled)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_lifetime_millis));
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_lifetime_millis), nullptr,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption("mysql_pool_connection_idle_timeout_millis",
 	                          "Maximum time in milliseconds a connection can sit idle in the cache before being closed "
 	                          "(default: 60000 - disabled)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis));
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis), nullptr,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption("mysql_pool_enable_reaper_thread",
 	                          "Whether to run a dedicated thread that periodically scans the pool and removes expired "
 	                          "connections (default: true)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.start_reaper_thread));
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.start_reaper_thread), nullptr,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "mysql_pool_acquire_mode",
 	    "How to acquire connections from the pool: 'force' (always connect, ignore pool limit), "
 	    "'wait' (block until available), 'try' (fail immediately if unavailable) (default: force)",
 	    LogicalType::VARCHAR, Value(dbconnector::pool::AcquireModeHelpers::ToString(default_pool_config.acquire_mode)),
-	    ValidatePoolAcquireMode);
+	    MySQLConnectionPool::ValidatePoolAcquireMode, SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "mysql_pool_enable_thread_local_cache",
 	    "Enable thread-local connection caching for faster same-thread connection reuse (default: false)",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.tl_cache_enabled));
-	config.AddExtensionOption("mysql_compression_aware_costs",
-	                          "Apply compression ratios when estimating transfer costs (default: true)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("mysql_compression_ratio",
-	                          "Compression ratio for transfer cost estimation (default: 0.7)", LogicalType::DOUBLE,
-	                          Value::DOUBLE(0.7), ValidateUnitInterval);
-	config.AddExtensionOption("mysql_push_threshold_with_index",
-	                          "Selectivity threshold for pushing filters with index support (default: 0.5)",
-	                          LogicalType::DOUBLE, Value::DOUBLE(0.5), ValidateUnitInterval);
-	config.AddExtensionOption("mysql_push_threshold_no_index",
-	                          "Selectivity threshold for pushing filters without index support (default: 0.3)",
-	                          LogicalType::DOUBLE, Value::DOUBLE(0.3), ValidateUnitInterval);
-	config.AddExtensionOption("mysql_hint_injection_enabled",
-	                          "Inject MySQL optimizer hints when statistics appear stale (default: false)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	config.AddExtensionOption("mysql_hint_staleness_threshold",
-	                          "Staleness score threshold for injecting optimizer hints (default: 0.5)",
-	                          LogicalType::DOUBLE, Value::DOUBLE(0.5), ValidateUnitInterval);
-	config.AddExtensionOption("mysql_adaptive_replan_enabled",
-	                          "Enable adaptive execution strategy based on actual vs estimated rows (default: true)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("mysql_explain_validation_enabled",
-	                          "Validate MySQL execution plans with EXPLAIN (default: false)", LogicalType::BOOLEAN,
-	                          Value::BOOLEAN(false));
-	config.AddExtensionOption("mysql_query_timeout_enabled",
-	                          "Add MAX_EXECUTION_TIME hint to MySQL queries for safety (default: true)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("mysql_query_timeout_min_ms", "Minimum query timeout in milliseconds (default: 5000)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(5000));
-	config.AddExtensionOption("mysql_query_timeout_max_ms", "Maximum query timeout in milliseconds (default: 300000)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(300000));
-	config.AddExtensionOption("mysql_sql_buffer_result",
-	                          "Add SQL_BUFFER_RESULT for large result sets to release row locks faster (default: true)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("mysql_aggregate_pushdown_enabled",
-	                          "Push aggregate functions (COUNT, SUM, etc.) to MySQL (default: true)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("mysql_order_pushdown_enabled",
-	                          "Push ORDER BY and LIMIT clauses to MySQL (default: true)", LogicalType::BOOLEAN,
-	                          Value::BOOLEAN(true));
-	// OptimizerExtension mysql_optimizer;
-	// mysql_optimizer.optimize_function = MySQLOptimizer::Optimize;
-	// OptimizerExtension::Register(config, std::move(mysql_optimizer));
+	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.tl_cache_enabled), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("mysql_pool_health_check_query",
+	                          "The query that is used to check that the connection is healthy. 'mysql_ping()' is used "
+	                          "instead of  query if this parameter is empty (default)",
+	                          LogicalType::VARCHAR, string(), nullptr, SetScope::GLOBAL);
+	OptimizerExtension mysql_optimizer;
+	mysql_optimizer.optimize_function = MySQLOptimizer::Optimize;
+	OptimizerExtension::Register(config, std::move(mysql_optimizer));
 }
 
 void MysqlScannerExtension::Load(ExtensionLoader &loader) {

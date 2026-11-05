@@ -8,8 +8,13 @@
 
 #pragma once
 
-#include "duckdb.hpp"
+#include <set>
+
 #include "mysql.h"
+
+#include "duckdb.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/types/value.hpp"
 
 namespace duckdb {
 
@@ -24,6 +29,16 @@ struct MySQLParameter {
 	MySQLParameter(const string &query, Value value_p);
 
 	MYSQL_BIND CreateBind();
+};
+
+class MySQLParameterHandles {
+	inline static mutex lock;
+	inline static std::set<int64_t> registry;
+
+public:
+	static int64_t Add(unique_ptr<vector<Value>> params);
+
+	static unique_ptr<vector<Value>> Remove(int64_t params_id);
 };
 
 } // namespace duckdb

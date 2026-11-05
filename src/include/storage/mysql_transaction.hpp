@@ -7,9 +7,14 @@
 
 #pragma once
 
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/enums/access_mode.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/transaction/transaction.hpp"
+
 #include "mysql_connection.hpp"
-#include "mysql_connection_pool.hpp"
+#include "storage/mysql_connection_pool.hpp"
 
 namespace duckdb {
 class MySQLCatalog;
@@ -21,34 +26,39 @@ enum class MySQLTransactionState { TRANSACTION_NOT_YET_STARTED, TRANSACTION_STAR
 class MySQLTransaction : public Transaction {
 public:
 	MySQLTransaction(MySQLCatalog &mysql_catalog, TransactionManager &manager, ClientContext &context);
-	~MySQLTransaction() override;
 
 	void Start();
 	void Commit();
 	void Rollback();
 
 	MySQLConnection &GetConnection();
-	//! Whether a transaction has been started on the remote server - if so, queries must be
-	//! executed through the transaction's connection so they see uncommitted changes
-	bool HasStartedTransaction() const {
-		return transactions_enabled && transaction_state == MySQLTransactionState::TRANSACTION_STARTED;
-	}
-	unique_ptr<MySQLResult> Query(const string &query);
+	uint64_t GetConnectionId();
 	static MySQLTransaction &Get(ClientContext &context, Catalog &catalog);
 	AccessMode GetAccessMode() const {
 		return access_mode;
 	}
 
+	//! Throws if the client context of this transaction is no longer available
+	shared_ptr<ClientContext> GetContext();
+	MySQLCatalog &GetCatalog() {
+		return catalog;
+	}
+	optional_ptr<CatalogEntry> ReferenceEntry(shared_ptr<CatalogEntry> &entry);
+
 private:
-	void EnsureConnection();
+	static bool GetTransactionsEnabled(ClientContext &context);
+	static MySQLConnectionInitOptions GetConnectionInitOptions(ClientContext &context);
 
 	MySQLCatalog &catalog;
-	MySQLPooledConnection pooled_connection;
-	bool transactions_enabled = true;
+	const bool transactions_enabled = true;
+	const AccessMode access_mode = AccessMode::READ_WRITE;
+	const MySQLConnectionInitOptions conn_init_opts;
+
+	mutex transaction_lock;
 	MySQLTransactionState transaction_state = MySQLTransactionState::TRANSACTION_NOT_YET_STARTED;
-	AccessMode access_mode;
-	string time_zone;
-	dbconnector::pool::AcquireMode acquire_mode = dbconnector::pool::AcquireMode::FORCE;
+	MySQLPooledConnection pooled_connection;
+
+	reference_map_t<CatalogEntry, shared_ptr<CatalogEntry>> referenced_entries;
 };
 
 } // namespace duckdb

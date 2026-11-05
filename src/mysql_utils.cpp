@@ -2,14 +2,15 @@
 
 #include <tuple>
 
+#include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include "dbconnector/query/query_writer.hpp"
 
-#include "storage/mysql_schema_entry.hpp"
-#include "storage/mysql_transaction.hpp"
-
 namespace duckdb {
+
+mutex MySQLUtils::libmariadb_races_lock;
+bool MySQLUtils::real_connect_succeeded_at_least_once = false;
 
 static bool ParseValue(const string &dsn, idx_t &pos, string &result) {
 	// skip leading spaces
@@ -77,7 +78,7 @@ bool ReadOptionFromEnv(const char *env, string &result) {
 
 uint32_t ParsePort(const string &value) {
 	constexpr const static int PORT_MIN = 0;
-	constexpr const static int PORT_MAX = 65353;
+	constexpr const static int PORT_MAX = 65535;
 	int port_val = std::stoi(value);
 	if (port_val < PORT_MIN || port_val > PORT_MAX) {
 		throw InvalidInputException("Invalid port %d - port must be between %d and %d", port_val, PORT_MIN, PORT_MAX);
@@ -193,10 +194,13 @@ std::tuple<MySQLConnectionParameters, unordered_set<string>> MySQLUtils::ParseCo
 		} else if (key == "ssl_key") {
 			set_options.insert("ssl_key");
 			result.ssl_key = value;
+		} else if (key == "connect_timeout") {
+			set_options.insert("connect_timeout");
+			result.connect_timeout = static_cast<uint32_t>(std::stoul(value));
 		} else {
 			throw InvalidInputException("Unrecognized configuration parameter \"%s\" "
 			                            "- expected options are host, "
-			                            "user, passwd, db, port, socket",
+			                            "user, passwd, db, port, socket, connect_timeout",
 			                            key);
 		}
 	}
@@ -230,6 +234,12 @@ std::tuple<MySQLConnectionParameters, unordered_set<string>> MySQLUtils::ParseCo
 			} else {
 				result.client_flag &= ~CLIENT_COMPRESS;
 			}
+		}
+	}
+	if (set_options.find("connect_timeout") == set_options.end()) {
+		string connect_timeout_str;
+		if (ReadOptionFromEnv("MYSQL_CONNECT_TIMEOUT", connect_timeout_str)) {
+			result.connect_timeout = static_cast<uint32_t>(std::stoul(connect_timeout_str));
 		}
 	}
 	return std::make_tuple(result, set_options);
@@ -278,7 +288,7 @@ static void SetSSLOptions(MYSQL *mysql, MySQLConnectionParameters &config) {
 }
 
 MYSQL *MySQLUtils::Connect(const string &dsn, const string &attach_path) {
-	MYSQL *mysql = mysql_init(NULL);
+	MYSQL *mysql = CallMySQLInit();
 	if (!mysql) {
 		throw IOException("Failure in mysql_init");
 	}
@@ -290,13 +300,18 @@ MYSQL *MySQLUtils::Connect(const string &dsn, const string &attach_path) {
 
 	SetSSLOptions(mysql, config);
 
+	if (config.connect_timeout > 0) {
+		unsigned int timeout = config.connect_timeout;
+		mysql_options(mysql, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+	}
+
 	// get connection options
 	const char *host = config.host.empty() ? nullptr : config.host.c_str();
 	const char *user = config.user.empty() ? nullptr : config.user.c_str();
 	const char *passwd = config.passwd.empty() ? nullptr : config.passwd.c_str();
 	const char *db = config.db.empty() ? nullptr : config.db.c_str();
 	const char *unix_socket = config.unix_socket.empty() ? nullptr : config.unix_socket.c_str();
-	result = mysql_real_connect(mysql, host, user, passwd, db, config.port, unix_socket, config.client_flag);
+	result = CallMySQLRealConnect(mysql, host, user, passwd, db, config.port, unix_socket, config.client_flag);
 	if (!result) {
 		string original_error = mysql_error(mysql);
 		string attempted_host = host ? host : "nullptr (default)";
@@ -305,9 +320,13 @@ MYSQL *MySQLUtils::Connect(const string &dsn, const string &attach_path) {
 			// options were partially cleared after the connection failure above
 			// and need to be re-applied
 			SetSSLOptions(mysql, config);
+			if (config.connect_timeout > 0) {
+				unsigned int timeout = config.connect_timeout;
+				mysql_options(mysql, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+			}
 			// re-try to establish connection specifying IP address to avoid using unix sockets
-			result =
-			    mysql_real_connect(mysql, "127.0.0.1", user, passwd, db, config.port, unix_socket, config.client_flag);
+			result = CallMySQLRealConnect(mysql, "127.0.0.1", user, passwd, db, config.port, unix_socket,
+			                              config.client_flag);
 
 			if (!result) {
 				string second_attempt_error = mysql_error(mysql);
@@ -370,34 +389,32 @@ string MySQLUtils::TransformConstant(const Value &val) {
 	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
 }
 
-MySQLVersion MySQLVersion::Parse(const string &version_string) {
-	MySQLVersion result;
-	if (StringUtil::Contains(StringUtil::Lower(version_string), "mariadb")) {
-		result.server_type = MySQLServerType::MARIADB;
-	}
+MYSQL *MySQLUtils::CallMySQLInit() {
+	lock_guard<mutex> guard(libmariadb_races_lock);
+	return mysql_init(nullptr);
+}
 
-	string version = version_string;
-	if (result.server_type == MySQLServerType::MARIADB && StringUtil::StartsWith(version, "5.5.5-")) {
-		// MariaDB servers can prefix their version with "5.5.5-" (replication compatibility)
-		version = version.substr(6);
-	}
-	// parse the leading major.minor.patch
-	idx_t numbers[3] = {0, 0, 0};
-	idx_t number_index = 0;
-	for (idx_t pos = 0; pos < version.size(); pos++) {
-		auto c = version[pos];
-		if (c >= '0' && c <= '9') {
-			numbers[number_index] = numbers[number_index] * 10 + static_cast<idx_t>(c - '0');
-		} else if (c == '.' && number_index < 2) {
-			number_index++;
-		} else {
-			break;
+MYSQL *MySQLUtils::CallMySQLRealConnect(MYSQL *mysql, const char *host, const char *user, const char *passwd,
+                                        const char *db, unsigned int port, const char *unix_socket,
+                                        unsigned long clientflag) {
+	bool lock_needed = true;
+	{
+		lock_guard<mutex> guard(libmariadb_races_lock);
+		if (real_connect_succeeded_at_least_once) {
+			lock_needed = false;
 		}
 	}
-	result.major_version = numbers[0];
-	result.minor_version = numbers[1];
-	result.patch_version = numbers[2];
-	return result;
+
+	if (lock_needed) {
+		lock_guard<mutex> guard(libmariadb_races_lock);
+		MYSQL *res = mysql_real_connect(mysql, host, user, passwd, db, port, unix_socket, clientflag);
+		if (res) {
+			real_connect_succeeded_at_least_once = true;
+		}
+		return res;
+	}
+
+	return mysql_real_connect(mysql, host, user, passwd, db, port, unix_socket, clientflag);
 }
 
 } // namespace duckdb

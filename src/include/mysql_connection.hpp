@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb.hpp"
 #include "duckdb/common/mutex.hpp"
 
 #include "mysql_result.hpp"
@@ -49,6 +49,11 @@ struct OwnedMySQLConnection {
 	MYSQL *connection;
 };
 
+struct MySQLConnectionInitOptions {
+	MySQLTypeConfig type_config;
+	string time_zone;
+};
+
 class MySQLConnection {
 public:
 	explicit MySQLConnection(shared_ptr<OwnedMySQLConnection> connection, MySQLTypeConfig type_config_p,
@@ -64,28 +69,22 @@ public:
 public:
 	static MySQLConnection Open(MySQLTypeConfig type_config, const string &connection_string,
 	                            const string &attach_path);
-	void Execute(const string &query);
-	void Execute(const string &query, const vector<Value> &params);
-	unique_ptr<MySQLResult> Query(const string &query, MySQLResultStreaming streaming);
-	unique_ptr<MySQLResult> Query(const string &query, const vector<Value> &params, MySQLResultStreaming streaming);
-	unique_ptr<MySQLResult> Query(MySQLStatement &stmt, const vector<Value> &params, MySQLResultStreaming streaming);
+	void Initialize(ClientContext &context, const MySQLConnectionInitOptions &options);
+	void Execute(ClientContext &context, const string &query);
+	void Execute(ClientContext &context, const string &query, const vector<Value> &params);
+	//! Not streamed result is read eagerly into a buffer-managed collection
+	unique_ptr<MySQLResult> Query(ClientContext &context, const string &query,
+	                              MySQLResultStreaming streaming = MySQLResultStreaming::FORCE_MATERIALIZATION);
+	unique_ptr<MySQLResult> Query(ClientContext &context, const string &query, const vector<Value> &params,
+	                              MySQLResultStreaming streaming);
+	unique_ptr<MySQLResult> QueryStmt(ClientContext &context, MySQLStatement &stmt, const vector<Value> &params,
+	                                  MySQLResultStreaming streaming);
 	unique_ptr<MySQLStatement> Prepare(const string &query);
 
 	vector<IndexInfo> GetIndexInfo(const string &table_name);
 
 	bool IsOpen();
 	void Close();
-
-	shared_ptr<OwnedMySQLConnection> GetConnection() {
-		return connection;
-	}
-
-	MYSQL *GetConn() {
-		if (!connection || !connection->connection) {
-			throw InternalException("MySQLConnection::GetConn - no connection available");
-		}
-		return connection->connection;
-	}
 
 	static void DebugSetPrintQueries(bool print);
 	static bool DebugPrintQueries();
@@ -94,11 +93,27 @@ public:
 		type_config = std::move(new_config);
 	}
 
+	bool IsConnectionHealthy(const string &health_check_query);
+	//! Runs KILL QUERY for the specified connection ID using a separate connection
+	static bool TryCancelQuery(ClientContext &context, const MySQLTypeConfig &type_config,
+	                           const string &connection_string, unsigned long connection_id);
+	void Reset();
+	string GetServerInfo();
+
 private:
-	unique_ptr<MySQLResult> QueryInternal(const string &query, const vector<Value> &params,
-	                                      MySQLResultStreaming streaming, MySQLConnectorInterface con_interface);
-	idx_t MySQLExecute(MYSQL_STMT *stmt, const string &query, const vector<Value> &params, bool streaming,
-	                   bool prepared = false);
+	unique_ptr<MySQLResult> QueryInternal(optional_ptr<ClientContext> context, const string &query,
+	                                      const vector<Value> &params, MySQLResultStreaming streaming,
+	                                      MySQLConnectorInterface con_interface);
+	idx_t MySQLExecute(optional_ptr<ClientContext> context, MYSQL_STMT *stmt, const string &query,
+	                   const vector<Value> &params, bool streaming, bool prepared = false);
+	void DrainBasicResult(optional_ptr<ClientContext> context, const string &query);
+
+	MYSQL *GetConn() {
+		if (!connection || !connection->connection) {
+			throw InternalException("MySQLConnection::GetConn - no connection available");
+		}
+		return connection->connection;
+	}
 
 	mutex query_lock;
 	shared_ptr<OwnedMySQLConnection> connection;

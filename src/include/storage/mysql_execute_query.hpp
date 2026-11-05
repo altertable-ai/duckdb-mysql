@@ -8,7 +8,11 @@
 
 #pragma once
 
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 
 namespace duckdb {
 class TableCatalogEntry;

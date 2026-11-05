@@ -8,8 +8,14 @@
 
 #pragma once
 
-#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/index_vector.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 namespace duckdb {
 
@@ -17,7 +23,7 @@ class MySQLInsert : public PhysicalOperator {
 public:
 	//! INSERT INTO
 	MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
-	            physical_index_vector_t<idx_t> column_index_map);
+	            unordered_set<idx_t> unspecified_columns);
 	//! CREATE TABLE AS
 	MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
 	            unique_ptr<BoundCreateTableInfo> info);
@@ -28,8 +34,8 @@ public:
 	optional_ptr<SchemaCatalogEntry> schema;
 	//! Create table info, in case of CREATE TABLE AS
 	unique_ptr<BoundCreateTableInfo> info;
-	//! column_index_map
-	physical_index_vector_t<idx_t> column_index_map;
+	//! Physical indexes of the columns not specified in the INSERT, these are left for MySQL to fill with defaults
+	unordered_set<idx_t> unspecified_columns;
 
 public:
 	// Source interface

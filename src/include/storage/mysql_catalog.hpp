@@ -8,13 +8,21 @@
 
 #pragma once
 
+#include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
-#include "mysql_connection.hpp"
-#include "mysql_connection_pool.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+
+#include "dbconnector/attached/attached_catalog.hpp"
+
+#include "storage/mysql_capabilities.hpp"
+#include "storage/mysql_connection_pool.hpp"
 #include "storage/mysql_schema_set.hpp"
-#include "storage/federation/plan_cache.hpp"
-#include "storage/mysql_statistics.hpp"
 
 namespace duckdb {
 class MySQLSchemaEntry;
@@ -22,9 +30,11 @@ class MySQLSchemaEntry;
 class MySQLCatalog : public Catalog {
 public:
 	explicit MySQLCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, AccessMode access_mode,
-	                      shared_ptr<MySQLConnectionPool> pool_p);
+	                      vector<string> schemas_to_load, shared_ptr<MySQLConnectionPool> pool_p,
+	                      bool remote_pushdown_enabled);
 	~MySQLCatalog();
 
+	Identifier catalog_name;
 	string connection_string;
 	string attach_path;
 	AccessMode access_mode;
@@ -61,32 +71,43 @@ public:
 	//! Whether or not this is an in-memory MySQL database
 	bool InMemory() override;
 	string GetDBPath() override;
+
 	bool Supports(RemoteCapability capability) const override {
-		switch (capability) {
-		case RemoteCapability::IS_REMOTE:
-		case RemoteCapability::EXECUTE_QUERY_NODE:
-		case RemoteCapability::CONNECT:
-			return true;
-		default:
-			return false;
-		}
+		return capabilities.Supports(capability);
 	}
+	bool SupportsPushdown(const ParsedExpression &expression) override {
+		return remote_pushdown_enabled && capabilities.SupportsPushdown(expression);
+	}
+	bool SupportsPushdown(const TableRef &ref) override {
+		return remote_pushdown_enabled && capabilities.SupportsPushdown(ref);
+	}
+	bool SupportsPushdown(const QueryNode &node) override {
+		return remote_pushdown_enabled && capabilities.SupportsPushdown(node);
+	}
+	bool SupportsPushdown(const SQLStatement &statement) override {
+		return remote_pushdown_enabled && capabilities.SupportsPushdown(statement);
+	}
+
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
+	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<SQLStatement> statement) override;
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, const string &sql) override;
-	bool SupportsPushdown(const ParsedExpression &expression) override;
-	bool SupportsPushdown(const TableRef &ref) override;
-	bool SupportsPushdown(const QueryNode &node) override;
+	unique_ptr<TableRef>
+	RemoteExecuteInternal(ClientContext &context, vector<string> statements,
+	                      vector<unique_ptr<ParsedExpression>> extra_args = vector<unique_ptr<ParsedExpression>>());
 
 	void ClearCache();
 
+	static void MaterializeMySQLScans(PhysicalOperator &op);
 	static bool IsMySQLScan(const string &name);
+	static bool IsMySQLQuery(const string &name);
+
+	static dbconnector::attached::AttachedCatalog Lookup(ClientContext &ctx, const Identifier &name);
 
 	MySQLConnectionPool &GetConnectionPool();
-	PlanCache &GetPlanCache();
-	MySQLStatsCache &GetStatsCache();
+	shared_ptr<MySQLConnectionPool> GetConnectionPoolPtr();
 	//! The server version, fetched when the database was attached
 	const MySQLVersion &GetVersion() const {
-		return version;
+		return capabilities.GetVersion();
 	}
 
 private:
@@ -95,10 +116,9 @@ private:
 private:
 	MySQLSchemaSet schemas;
 	string default_schema;
-	MySQLVersion version;
+	MySQLCapabilities capabilities;
 	shared_ptr<MySQLConnectionPool> connection_pool;
-	PlanCache plan_cache_;
-	MySQLStatsCache stats_cache_;
+	bool remote_pushdown_enabled;
 };
 
 } // namespace duckdb

@@ -1,10 +1,18 @@
-#include "storage/mysql_catalog.hpp"
-#include "storage/mysql_schema_entry.hpp"
 #include "storage/mysql_table_entry.hpp"
-#include "storage/mysql_transaction.hpp"
+
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
+
+#include "mysql_filter_pushdown.hpp"
 #include "mysql_scanner.hpp"
+#include "storage/mysql_catalog.hpp"
+#include "storage/mysql_schema_entry.hpp"
+#include "storage/mysql_transaction.hpp"
 
 namespace duckdb {
 
@@ -68,13 +76,31 @@ static bool TableIsInternal(const SchemaCatalogEntry &schema, const string &name
 }
 
 MySQLTableEntry::MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-    : TableCatalogEntry(catalog, schema, info) {
-	this->internal = TableIsInternal(schema, name);
+    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)) {
+	this->internal = TableIsInternal(schema, name.GetIdentifierName());
+	for (auto &col : columns.Logical()) {
+		if (col.HasDefaultValue()) {
+			default_columns.insert(col.Logical().index);
+		}
+	}
 }
 
 MySQLTableEntry::MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, MySQLTableInfo &info)
-    : TableCatalogEntry(catalog, schema, *info.create_info) {
-	this->internal = TableIsInternal(schema, name);
+    : TableCatalogEntry(catalog, schema, *info.create_info), columns(std::move(info.create_info->columns)),
+      generated_columns(std::move(info.generated_columns)), default_columns(std::move(info.default_columns)) {
+	this->internal = TableIsInternal(schema, name.GetIdentifierName());
+}
+
+const ColumnList &MySQLTableEntry::GetColumns() const {
+	return columns;
+}
+
+bool MySQLTableEntry::IsGeneratedColumn(LogicalIndex index) const {
+	return generated_columns.find(index.index) != generated_columns.end();
+}
+
+bool MySQLTableEntry::HasDefaultValue(LogicalIndex index) const {
+	return default_columns.find(index.index) != default_columns.end();
 }
 
 unique_ptr<BaseStatistics> MySQLTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
@@ -87,24 +113,27 @@ void MySQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, Logica
 
 static bool GetBoolSetting(ClientContext &context, const std::string &name) {
 	Value val;
-	if (context.TryGetCurrentSetting(name, val)) {
+	if (context.TryGetCurrentSetting(Identifier(name), val)) {
 		return BooleanValue::Get(val);
 	}
 	return false;
 }
 
 TableFunction MySQLTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
-	auto result = make_uniq<MySQLBindData>(*this);
+	MySQLCatalog &catalog = ParentCatalog().Cast<MySQLCatalog>();
+	MySQLTransaction &transaction = MySQLTransaction::Get(context, catalog);
+	auto result = make_uniq<MySQLBindData>(*this, transaction.context);
 	for (auto &col : columns.Logical()) {
 		result->types.push_back(col.GetType());
-		result->names.push_back(col.GetName());
+		result->names.emplace_back(col.GetName().GetIdentifierName());
 	}
-	bool use_predicate_analyzer = GetBoolSetting(context, "mysql_enable_predicate_analyzer");
-	result->use_predicate_analyzer = use_predicate_analyzer;
 	bind_data = std::move(result);
 
 	auto function = MySQLScanFunction();
-	function.filter_pushdown = use_predicate_analyzer || GetBoolSetting(context, "mysql_enable_filter_pushdown");
+	function.filter_pushdown = GetBoolSetting(context, "mysql_enable_filter_pushdown");
+	if (function.filter_pushdown) {
+		function.pushdown_expression = MySQLFilterPushdown::CanPushExpressionDown;
+	}
 	return function;
 }
 
@@ -113,8 +142,19 @@ TableStorageInfo MySQLTableEntry::GetStorageInfo(ClientContext &context) {
 	auto &db = transaction.GetConnection();
 	TableStorageInfo result;
 	result.cardinality = 0;
-	result.index_info = db.GetIndexInfo(name);
+	result.index_info = db.GetIndexInfo(name.GetIdentifierName());
 	return result;
+}
+
+dbconnector::attached::AttachedTable MySQLTableEntry::Lookup(ClientContext &ctx, QualifiedName name) {
+	using namespace dbconnector::attached;
+
+	AttachedTable table = AttachedTable::Lookup(ctx, "mysql", name);
+	if (!table) {
+		throw InvalidInputException("Attached MySQL table, name: %s is not found in the specified client session",
+		                            name.ToString());
+	}
+	return table;
 }
 
 } // namespace duckdb

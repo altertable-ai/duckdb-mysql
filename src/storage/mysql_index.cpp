@@ -1,8 +1,15 @@
-#include "storage/mysql_catalog.hpp"
 #include "storage/mysql_index.hpp"
-#include "duckdb/parser/statement/create_statement.hpp"
-#include "duckdb/planner/operator/logical_extension_operator.hpp"
+
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+
+#include "storage/mysql_catalog.hpp"
 
 namespace duckdb {
 
@@ -18,10 +25,12 @@ MySQLCreateIndex::MySQLCreateIndex(PhysicalPlan &physical_plan, unique_ptr<Creat
 SourceResultType MySQLCreateIndex::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                    OperatorSourceInput &input) const {
 	auto &catalog = table.catalog;
-	if (info->catalog == INVALID_CATALOG && info->schema == catalog.GetName()) {
-		info->schema = DEFAULT_SCHEMA;
+	if (info->GetQualifiedName().Catalog() == INVALID_CATALOG &&
+	    info->GetQualifiedName().Schema() == catalog.GetName()) {
+		info->SetQualifiedName(QualifiedName(info->GetQualifiedName().Catalog(), Identifier::DefaultSchema(),
+		                                     info->GetQualifiedName().Name()));
 	}
-	auto &schema = catalog.GetSchema(context.client, info->schema);
+	auto &schema = catalog.GetSchema(context.client, info->GetQualifiedName().Schema());
 	schema.CreateIndex(context.client, *info, table);
 
 	return SourceResultType::FINISHED;

@@ -1,8 +1,16 @@
 #include "mysql_sql_writer.hpp"
 
+#include <unordered_map>
+
+#include "duckdb.hpp"
+#include "duckdb/common/index_map.hpp"
+#include "duckdb/common/logical_type_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -15,16 +23,21 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/alter_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
-#include "duckdb/common/extra_type_info.hpp"
 
+#include "mysql_types.hpp"
 #include "mysql_utils.hpp"
+#include "mysql_version.hpp"
 
 namespace duckdb {
 
@@ -32,9 +45,12 @@ MySQLSQLWriter::MySQLSQLWriter(ClientContext &context, const MySQLVersion &versi
     : context(context), binary_collation(version.GetBinaryCollation()) {
 }
 
-string MySQLSQLWriter::MySQLToString(ClientContext &context, const MySQLVersion &version, const QueryNode &node) {
+vector<string> MySQLSQLWriter::ToStatements(ClientContext &context, const MySQLVersion &version,
+                                            const QueryNode &node) {
 	MySQLSQLWriter writer(context, version);
-	return writer.WriteQueryNode(node);
+	vector<string> statements;
+	statements.emplace_back(writer.WriteQueryNode(node));
+	return statements;
 }
 
 //===--------------------------------------------------------------------===//
@@ -85,6 +101,17 @@ string MySQLSQLWriter::WriteConstant(const Value &value) {
 		return "TIME " + MySQLUtils::WriteLiteral(value.ToString());
 	case LogicalTypeId::TIMESTAMP:
 		return "TIMESTAMP " + MySQLUtils::WriteLiteral(value.ToString());
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		// MySQL has no time zone aware literals - convert the value to a timestamp in the DuckDB
+		// session time zone, the same way DuckDB casts it when comparing it against or assigning
+		// it to a (DATETIME / TIMESTAMP) column
+		auto local_value = value.TryCastAs(context, LogicalType::TIMESTAMP);
+		if (!local_value) {
+			throw InternalException("MySQLSQLWriter: TIMESTAMP WITH TIME ZONE literal cannot be converted to "
+			                        "TIMESTAMP - should have been blocked by SupportsPushdown");
+		}
+		return "TIMESTAMP " + MySQLUtils::WriteLiteral(local_value->ToString());
+	}
 	default:
 		throw InternalException("MySQLSQLWriter: unsupported constant type %s - should have been blocked by "
 		                        "SupportsPushdown",
@@ -118,14 +145,6 @@ string MySQLSQLWriter::WriteCastType(const LogicalType &type) {
 		return "DOUBLE";
 	case LogicalTypeId::DECIMAL:
 		return StringUtil::Format("DECIMAL(%d,%d)", DecimalType::GetWidth(type), DecimalType::GetScale(type));
-	case LogicalTypeId::UNBOUND: {
-		auto try_bind = UnboundType::TryDefaultBind(type);
-		if (try_bind.id() == LogicalTypeId::UNBOUND) {
-			throw InternalException("MySQLSQLWriter: unsupported unbound cast type - should have been blocked by "
-			                        "SupportsPushdown");
-		}
-		return WriteCastType(try_bind);
-	}
 	default:
 		throw InternalException("MySQLSQLWriter: unsupported cast type %s - should have been blocked by "
 		                        "SupportsPushdown",
@@ -149,12 +168,20 @@ string MySQLSQLWriter::WriteExpressionList(const vector<unique_ptr<ParsedExpress
 }
 
 string MySQLSQLWriter::WriteColumnRef(const ColumnRefExpression &column_ref) {
+	// SQL value functions without parentheses (CURRENT_TIMESTAMP, ...) are parsed as unqualified
+	// column references - write the ones MySQL supports in the same form unquoted, so MySQL
+	// evaluates them instead of looking up a column
+	static const case_insensitive_set_t MYSQL_VALUE_FUNCTIONS = {"current_date", "current_time", "current_timestamp",
+	                                                             "localtime", "localtimestamp"};
+	if (!column_ref.IsQualified() && MYSQL_VALUE_FUNCTIONS.count(column_ref.GetColumnName().GetIdentifierName()) > 0) {
+		return StringUtil::Upper(column_ref.GetColumnName().GetIdentifierName());
+	}
 	string result;
 	for (auto &column_name : column_ref.ColumnNames()) {
 		if (!result.empty()) {
 			result += ".";
 		}
-		result += WriteIdentifier(column_name);
+		result += WriteIdentifier(column_name.GetIdentifierName());
 	}
 	return result;
 }
@@ -262,7 +289,7 @@ string MySQLSQLWriter::WriteFunctionCall(const string &function_name, const vect
 
 string MySQLSQLWriter::WriteFunction(const FunctionExpression &func) {
 	auto &children = func.GetArguments();
-	auto name = StringUtil::Lower(func.FunctionName());
+	auto name = StringUtil::Lower(func.FunctionName().GetIdentifierName());
 	if (name == "~~" || name == "!~~") {
 		// [NOT] LIKE - DuckDB's LIKE has no default escape character, while MySQL's default
 		// escape character is backslash; disable it with an empty ESCAPE clause
@@ -290,7 +317,7 @@ string MySQLSQLWriter::WriteFunction(const FunctionExpression &func) {
 		                        "SupportsPushdown",
 		                        name);
 	}
-	return WriteFunctionCall(func.FunctionName(), children, func.Distinct());
+	return WriteFunctionCall(func.FunctionName().GetIdentifierName(), children, func.Distinct());
 }
 
 static string MySQLWriteWindowBoundary(WindowBoundary boundary, const string &boundary_expr) {
@@ -313,7 +340,8 @@ static string MySQLWriteWindowBoundary(WindowBoundary boundary, const string &bo
 }
 
 string MySQLSQLWriter::WriteWindow(const WindowExpression &window) {
-	string result = WriteFunctionCall(window.FunctionName(), window.GetArguments(), window.Distinct());
+	string result =
+	    WriteFunctionCall(window.FunctionName().GetIdentifierName(), window.GetArguments(), window.Distinct());
 	result += " OVER (";
 	string sep;
 	if (!window.Partitions().empty()) {
@@ -440,14 +468,14 @@ string MySQLSQLWriter::WriteSubquery(const SubqueryExpression &subquery) {
 string MySQLSQLWriter::WriteExpression(const ParsedExpression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::CONSTANT:
-		return WriteConstant(expr.Cast<ConstantExpression>().GetValue());
+		return WriteConstant(expr.Cast<ConstantExpression>().GetLiteral().ToValue());
 	case ExpressionClass::COLUMN_REF:
 		return WriteColumnRef(expr.Cast<ColumnRefExpression>());
 	case ExpressionClass::STAR: {
 		auto &star = expr.Cast<StarExpression>();
 		if (!star.RelationName().empty()) {
 			// qualified star (e.g. t.*)
-			return WriteIdentifier(star.RelationName()) + ".*";
+			return WriteIdentifier(star.RelationName().GetIdentifierName()) + ".*";
 		}
 		return "*";
 	}
@@ -471,25 +499,26 @@ string MySQLSQLWriter::WriteExpression(const ParsedExpression &expr) {
 		return WriteCase(expr.Cast<CaseExpression>());
 	case ExpressionClass::CAST: {
 		auto &cast_expr = expr.Cast<CastExpression>();
+		// the cast target is an unbound type expression - resolve it against the built-in types
+		const TypeExpression &target_type_expr = cast_expr.TargetType();
+		LogicalType target_type = MySQLTypes::ToLogicalType(target_type_expr);
 		if (cast_expr.Child().GetExpressionClass() == ExpressionClass::CONSTANT) {
 			// casts of literals are evaluated locally and serialized as the resulting value -
 			// MySQL's CAST diverges from DuckDB's for malformed input (NULL / partial values
 			// instead of errors), numeric strings ('1e2', '5.7') and time zone offsets
 			// (SupportsPushdown verifies that the cast succeeds)
-			auto &value = cast_expr.Child().Cast<ConstantExpression>().GetValue();
-			auto target_type = cast_expr.TargetType();
-			if (target_type.id() == LogicalTypeId::UNBOUND) {
-				target_type = UnboundType::TryDefaultBind(target_type);
-			}
-			Value cast_result;
-			string error;
-			if (!value.DefaultTryCastAs(target_type, cast_result, &error)) {
+			auto value = cast_expr.Child().Cast<ConstantExpression>().GetLiteral().ToValue();
+			// strings without an explicit offset are cast to TIMESTAMP WITH TIME ZONE in the
+			// session time zone, which requires the client context
+			auto cast_result = target_type.id() == LogicalTypeId::TIMESTAMP_TZ ? value.TryCastAs(context, target_type)
+			                                                                   : value.DefaultTryCastAs(target_type);
+			if (!cast_result) {
 				throw InternalException("MySQLSQLWriter: cast of literal failed - should have been blocked by "
 				                        "SupportsPushdown");
 			}
-			return WriteConstant(cast_result);
+			return WriteConstant(*cast_result);
 		}
-		return "CAST(" + WriteExpression(cast_expr.Child()) + " AS " + WriteCastType(cast_expr.TargetType()) + ")";
+		return "CAST(" + WriteExpression(cast_expr.Child()) + " AS " + WriteCastType(target_type) + ")";
 	}
 	case ExpressionClass::BETWEEN: {
 		auto &between = expr.Cast<BetweenExpression>();
@@ -512,12 +541,12 @@ string MySQLSQLWriter::WriteTableRef(const TableRef &ref) {
 	case TableReferenceType::BASE_TABLE: {
 		auto &base = ref.Cast<BaseTableRef>();
 		string result;
-		if (!base.schema_name.empty()) {
-			result += WriteIdentifier(base.schema_name) + ".";
+		if (!base.GetQualifiedName().Schema().empty()) {
+			result += WriteIdentifier(base.GetQualifiedName().Schema().GetIdentifierName()) + ".";
 		}
-		result += WriteIdentifier(base.table_name);
+		result += WriteIdentifier(base.Table().GetIdentifierName());
 		if (!base.alias.empty()) {
-			result += " AS " + WriteIdentifier(base.alias);
+			result += " AS " + WriteIdentifier(base.alias.GetIdentifierName());
 		}
 		return result;
 	}
@@ -557,7 +586,7 @@ string MySQLSQLWriter::WriteTableRef(const TableRef &ref) {
 				if (i > 0) {
 					result += ", ";
 				}
-				result += WriteIdentifier(join.using_columns[i]);
+				result += WriteIdentifier(join.using_columns[i].GetIdentifierName());
 			}
 			result += ")";
 		}
@@ -567,7 +596,7 @@ string MySQLSQLWriter::WriteTableRef(const TableRef &ref) {
 	case TableReferenceType::SUBQUERY: {
 		auto &subquery = ref.Cast<SubqueryRef>();
 		// MySQL requires an alias for every derived table - generate one if there is none
-		string alias = subquery.alias;
+		string alias = subquery.alias.GetIdentifierName();
 		if (alias.empty()) {
 			alias = "mysql_unnamed_subquery" + to_string(++unnamed_subquery_index);
 		}
@@ -596,21 +625,20 @@ string MySQLSQLWriter::WriteOrderList(const vector<OrderByNode> &orders,
 		string null_key;
 		auto &expr = *order.expression;
 		if (expr.GetExpressionClass() == ExpressionClass::CONSTANT) {
-			auto &val = expr.Cast<ConstantExpression>().GetValue();
+			auto val = expr.Cast<ConstantExpression>().GetLiteral().ToValue();
 			if (val.type().IsIntegral() && !val.IsNull() && select_list) {
 				// positional reference (e.g. ORDER BY 1) - resolve it against the select list
 				// SupportsPushdown verifies that this resolution is possible
-				Value bigint_value;
-				string error;
-				if (val.DefaultTryCastAs(LogicalType::BIGINT, bigint_value, &error) && !bigint_value.IsNull()) {
-					auto index = BigIntValue::Get(bigint_value);
+				auto bigint_value = val.DefaultTryCastAs(LogicalType::BIGINT);
+				if (bigint_value && !bigint_value->IsNull()) {
+					auto index = BigIntValue::Get(*bigint_value);
 					if (index >= 1 && idx_t(index) <= select_list->size()) {
 						auto &target = *(*select_list)[idx_t(index) - 1];
 						// reference the output column by its alias where possible - expressions over
 						// output columns satisfy MySQL's ONLY_FULL_GROUP_BY checks where raw expression
 						// copies may not
-						null_key =
-						    target.GetAlias().empty() ? WriteExpression(target) : WriteIdentifier(target.GetAlias());
+						null_key = target.GetAlias().empty() ? WriteExpression(target)
+						                                     : WriteIdentifier(target.GetAlias().GetIdentifierName());
 					}
 				}
 			}
@@ -689,14 +717,14 @@ string MySQLSQLWriter::WriteCTEMap(const CommonTableExpressionMap &cte_map) {
 			result += ", ";
 		}
 		auto &cte = *kv.second;
-		result += WriteIdentifier(kv.first);
+		result += WriteIdentifier(kv.first.GetIdentifierName());
 		if (!cte.aliases.empty()) {
 			result += " (";
 			for (idx_t k = 0; k < cte.aliases.size(); k++) {
 				if (k > 0) {
 					result += ", ";
 				}
-				result += WriteIdentifier(cte.aliases[k]);
+				result += WriteIdentifier(cte.aliases[k].GetIdentifierName());
 			}
 			result += ")";
 		}
@@ -725,7 +753,7 @@ string MySQLSQLWriter::WriteSelectNode(const SelectNode &node) {
 		auto &select_expr = *node.select_list[i];
 		result += WriteExpression(select_expr);
 		if (!select_expr.GetAlias().empty()) {
-			result += " AS " + WriteIdentifier(select_expr.GetAlias());
+			result += " AS " + WriteIdentifier(select_expr.GetAlias().GetIdentifierName());
 		} else if (select_expr.GetExpressionClass() != ExpressionClass::STAR &&
 		           select_expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
 			// alias the column with DuckDB's name for the expression so that the result column
@@ -770,6 +798,54 @@ string MySQLSQLWriter::WriteSelectNode(const SelectNode &node) {
 	return result;
 }
 
+string MySQLSQLWriter::WriteUpdateNode(const UpdateQueryNode &node) {
+	string result = WriteCTEMap(node.cte_map);
+	result += "UPDATE ";
+	result += WriteTableRef(*node.table);
+	if (node.from_table) {
+		result += ", " + WriteTableRef(*node.from_table);
+	}
+	result += " SET ";
+	for (idx_t i = 0; i < node.set_info->columns.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += WriteIdentifier(node.set_info->columns[i].GetIdentifierName()) + " = " +
+		          WriteExpression(*node.set_info->expressions[i]);
+	}
+	if (node.set_info->condition) {
+		result += " WHERE " + WriteExpression(*node.set_info->condition);
+	}
+	if (!node.returning_list.empty()) {
+		throw InternalException("MySQLSQLWriter: RETURNING clause should have been blocked by SupportsPushdown");
+	}
+	result += WriteResultModifiers(node, nullptr);
+	return result;
+}
+
+string MySQLSQLWriter::WriteDeleteNode(const DeleteQueryNode &node) {
+	string result = WriteCTEMap(node.cte_map);
+	result += "DELETE FROM ";
+	result += WriteTableRef(*node.table);
+	if (!node.using_clauses.empty()) {
+		result += " USING ";
+		for (idx_t i = 0; i < node.using_clauses.size(); i++) {
+			if (i > 0) {
+				result += ", ";
+			}
+			result += WriteTableRef(*node.using_clauses[i]);
+		}
+	}
+	if (node.condition) {
+		result += " WHERE " + WriteExpression(*node.condition);
+	}
+	if (!node.returning_list.empty()) {
+		throw InternalException("MySQLSQLWriter: RETURNING clause should have been blocked by SupportsPushdown");
+	}
+	result += WriteResultModifiers(node, nullptr);
+	return result;
+}
+
 string MySQLSQLWriter::WriteSetOperationNode(const SetOperationNode &node) {
 	string result = WriteCTEMap(node.cte_map);
 	for (idx_t i = 0; i < node.children.size(); i++) {
@@ -808,12 +884,306 @@ string MySQLSQLWriter::WriteQueryNode(const QueryNode &node) {
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE:
 		return WriteSelectNode(node.Cast<SelectNode>());
+	case QueryNodeType::UPDATE_QUERY_NODE:
+		return WriteUpdateNode(node.Cast<UpdateQueryNode>());
+	case QueryNodeType::DELETE_QUERY_NODE:
+		return WriteDeleteNode(node.Cast<DeleteQueryNode>());
 	case QueryNodeType::SET_OPERATION_NODE:
 		return WriteSetOperationNode(node.Cast<SetOperationNode>());
 	case QueryNodeType::RECURSIVE_CTE_NODE:
 		return WriteRecursiveCTENode(node.Cast<RecursiveCTENode>());
 	default:
 		throw InternalException("MySQLSQLWriter: unsupported query node type - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+}
+
+vector<string> MySQLSQLWriter::ToStatements(ClientContext &context, const MySQLVersion &version,
+                                            const SQLStatement &statement) {
+	MySQLSQLWriter writer(context, version);
+	return writer.WriteStatement(statement);
+}
+
+vector<string> WrapIntoVector(string sql) {
+	vector<string> res;
+	res.emplace_back(std::move(sql));
+	return res;
+}
+
+vector<string> MySQLSQLWriter::WriteStatement(const SQLStatement &statement) {
+	switch (statement.type) {
+	case StatementType::CREATE_STATEMENT:
+		return WriteCreateStatement(*statement.Cast<CreateStatement>().info);
+	case StatementType::DROP_STATEMENT: {
+		string res = WriteDropStatement(*statement.Cast<DropStatement>().info);
+		return WrapIntoVector(res);
+	}
+	case StatementType::ALTER_STATEMENT: {
+		string res = WriteAlterStatement(*statement.Cast<AlterStatement>().info);
+		return WrapIntoVector(res);
+	}
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported statement type - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+}
+
+vector<string> MySQLSQLWriter::WriteCreateStatement(const CreateInfo &info) {
+	switch (info.type) {
+	case CatalogType::TABLE_ENTRY:
+		return WriteCreateTableStatement(info.Cast<CreateTableInfo>());
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported CreateInfo type - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+}
+
+static string MySQLColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Constraint>> &constraints,
+                                const std::unordered_map<string, LogicalType> &column_types) {
+	string result;
+
+	result += "(";
+
+	// find all columns that have NOT NULL specified, but are NOT primary key
+	// columns
+	logical_index_set_t not_null_columns;
+	logical_index_set_t unique_columns;
+	logical_index_set_t pk_columns;
+	identifier_set_t multi_key_pks;
+	vector<string> extra_constraints;
+	for (auto &constraint : constraints) {
+		if (constraint->type == ConstraintType::NOT_NULL) {
+			auto &not_null = constraint->Cast<NotNullConstraint>();
+			not_null_columns.insert(not_null.index);
+		} else if (constraint->type == ConstraintType::UNIQUE) {
+			auto &pk = constraint->Cast<UniqueConstraint>();
+			auto constraint_columns = IdentifiersToStrings(pk.columns);
+			if (pk.index.index != DConstants::INVALID_INDEX) {
+				// no columns specified: single column constraint
+				if (pk.is_primary_key) {
+					pk_columns.insert(pk.index);
+				} else {
+					unique_columns.insert(pk.index);
+				}
+			} else {
+				// multi-column constraint, this constraint needs to go at the end after
+				// all columns
+				if (pk.is_primary_key) {
+					// multi key pk column: insert set of columns into multi_key_pks
+					for (auto &col : pk.columns) {
+						multi_key_pks.insert(col);
+					}
+				}
+				extra_constraints.push_back(constraint->ToString());
+			}
+		} else if (constraint->type == ConstraintType::FOREIGN_KEY) {
+			auto &fk = constraint->Cast<ForeignKeyConstraint>();
+			if (fk.info.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE ||
+			    fk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE) {
+				extra_constraints.push_back(constraint->ToString());
+			} else {
+				throw InternalException("MySQLSQLWriter: unsupported constraint - should have been blocked by "
+				                        "SupportsPushdown: \"%s\"",
+				                        constraint->ToString());
+			}
+		} else if (constraint->type == ConstraintType::CHECK) {
+			// write CHECK constraint as is, accepted by the server even if not enforced
+			extra_constraints.push_back(constraint->ToString());
+		} else {
+			throw InternalException("MySQLSQLWriter: unsupported constraint - should have been blocked by "
+			                        "SupportsPushdown: \"%s\"",
+			                        constraint->ToString());
+		}
+	}
+
+	for (const ColumnDefinition &column : columns.Logical()) {
+		if (column.Oid() > 0) {
+			result += ", ";
+		}
+		string col_name = column.Name().GetIdentifierName();
+		result += MySQLUtils::WriteIdentifier(col_name);
+		result += " ";
+		auto it = column_types.find(col_name);
+		D_ASSERT(it != column_types.end());
+		const LogicalType &column_type = it->second;
+		result += MySQLTypes::TypeToString(column_type);
+		bool not_null = not_null_columns.find(column.Logical()) != not_null_columns.end();
+		bool is_single_key_pk = pk_columns.find(column.Logical()) != pk_columns.end();
+		bool is_multi_key_pk = multi_key_pks.find(Identifier(column.Name().GetIdentifierName())) != multi_key_pks.end();
+		bool is_unique = unique_columns.find(column.Logical()) != unique_columns.end();
+		if (not_null && !is_single_key_pk && !is_multi_key_pk) {
+			// NOT NULL but not a primary key column
+			result += " NOT NULL";
+		}
+		if (is_single_key_pk) {
+			// single column pk: insert constraint here
+			result += " PRIMARY KEY";
+		}
+		if (is_unique) {
+			// single column unique: insert constraint here
+			result += " UNIQUE";
+		}
+		if (column.Generated()) {
+			result += " GENERATED ALWAYS AS(";
+			if (column.GeneratedExpression().GetExpressionType() == ExpressionType::OPERATOR_CAST) {
+				const CastExpression &cast_expr = column.GeneratedExpression().Cast<CastExpression>();
+				result += cast_expr.Child().ToString();
+			} else {
+				result += column.GeneratedExpression().ToString();
+			}
+			result += ")";
+		} else if (column.HasDefaultValue()) {
+			result += " DEFAULT(";
+			result += column.DefaultValue().ToString();
+			result += ")";
+		}
+		if (column_type.id() == LogicalTypeId::VARCHAR) {
+			string collation = StringType::GetCollation(column_type);
+			if (!collation.empty()) {
+				result += " COLLATE ";
+				result += MySQLUtils::WriteIdentifier(collation);
+			}
+		}
+	}
+	// print any extra constraints that still need to be printed
+	for (auto &extra_constraint : extra_constraints) {
+		result += ", ";
+		result += extra_constraint;
+	}
+
+	result += ")";
+	return result;
+}
+
+vector<string> MySQLSQLWriter::WriteCreateTableStatement(const CreateTableInfo &info) {
+	MySQLTypeConfig type_config(context);
+	std::unordered_map<string, LogicalType> column_types;
+	for (idx_t i = 0; i < info.columns.LogicalColumnCount(); i++) {
+		const ColumnDefinition &col = info.columns.GetColumn(LogicalIndex(i));
+		const unique_ptr<ParsedExpression> &expr = UnboundType::GetTypeExpression(col.GetType());
+		LogicalType duckdb_type = MySQLTypes::ToLogicalType(expr.get());
+		LogicalType mysql_type = MySQLTypes::ToMySQLType(type_config, duckdb_type);
+		column_types.emplace(col.Name().GetIdentifierName(), std::move(mysql_type));
+	}
+
+	string qualified_name = WriteQualifiedName(info.GetQualifiedName());
+
+	string result;
+	vector<string> statements;
+	result += "CREATE TABLE ";
+	switch (info.on_conflict) {
+	case OnCreateConflict::ERROR_ON_CONFLICT:
+		break;
+	case OnCreateConflict::IGNORE_ON_CONFLICT:
+		result += "IF NOT EXISTS ";
+	case OnCreateConflict::REPLACE_ON_CONFLICT: {
+		string drop = "DROP TABLE IF EXISTS ";
+		drop += qualified_name;
+		statements.emplace_back(drop);
+		break;
+	}
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported OnCreateConflict - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+	result += qualified_name;
+	result += MySQLColumnsToSQL(info.columns, info.constraints, column_types);
+	statements.emplace_back(std::move(result));
+	return statements;
+}
+
+string MySQLSQLWriter::WriteDropStatement(const DropInfo &info) {
+	switch (info.type) {
+	case CatalogType::TABLE_ENTRY:
+		return WriteDropTableStatement(info);
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported DROP catalog type - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+}
+
+string MySQLSQLWriter::WriteDropTableStatement(const DropInfo &info) {
+	string result = "DROP TABLE ";
+	switch (info.if_not_found) {
+	case OnEntryNotFound::THROW_EXCEPTION:
+		break;
+	case OnEntryNotFound::RETURN_NULL:
+		result += "IF EXISTS ";
+		break;
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported OnEntryNotFound - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+
+	result += WriteQualifiedName(info.GetQualifiedName());
+
+	return result;
+}
+
+string MySQLSQLWriter::WriteQualifiedName(const QualifiedName &name) {
+	string res;
+	Identifier schema = name.Schema();
+	// TODO: default schema
+	if (!schema.empty() && schema != Identifier::DefaultSchema()) {
+		res += MySQLUtils::WriteIdentifier(schema.GetIdentifierName());
+		res += ".";
+	}
+	res += MySQLUtils::WriteIdentifier(name.Name().GetIdentifierName());
+	return res;
+}
+
+string MySQLSQLWriter::WriteAlterStatement(const AlterInfo &info) {
+	switch (info.type) {
+	case AlterType::ALTER_TABLE:
+		return WriteAlterTableStatement(info.Cast<AlterTableInfo>());
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported ALTER catalog type - should have been blocked by "
+		                        "SupportsPushdown");
+	}
+}
+
+string MySQLSQLWriter::WriteAlterTableStatement(const AlterTableInfo &info) {
+	string result = "ALTER TABLE ";
+	result += WriteQualifiedName(info.GetQualifiedName());
+
+	switch (info.alter_table_type) {
+	case AlterTableType::RENAME_TABLE: {
+		const RenameTableInfo &rename_info = info.Cast<RenameTableInfo>();
+		result += " RENAME TO ";
+		result += MySQLUtils::WriteIdentifier(rename_info.new_table_name.GetIdentifierName());
+		return result;
+	}
+	case AlterTableType::RENAME_COLUMN: {
+		const RenameColumnInfo &rename_info = info.Cast<RenameColumnInfo>();
+		result += " RENAME COLUMN  ";
+		result += MySQLUtils::WriteIdentifier(rename_info.old_name.GetIdentifierName());
+		result += " TO ";
+		result += MySQLUtils::WriteIdentifier(rename_info.new_name.GetIdentifierName());
+		return result;
+	}
+	case AlterTableType::ADD_COLUMN: {
+		const AddColumnInfo &add_info = info.Cast<AddColumnInfo>();
+		result += " ADD COLUMN  ";
+		if (add_info.if_column_not_exists) {
+			result += "IF NOT EXISTS ";
+		}
+		result += MySQLUtils::WriteIdentifier(add_info.new_column.Name().GetIdentifierName());
+		result += " ";
+		result += add_info.new_column.Type().ToString();
+		return result;
+	}
+	case AlterTableType::REMOVE_COLUMN: {
+		const RemoveColumnInfo &remove_info = info.Cast<RemoveColumnInfo>();
+		result += " DROP COLUMN  ";
+		if (remove_info.if_column_exists) {
+			throw InternalException("MySQLSQLWriter: DROP COLUMN IF EXISTS - should have been blocked by "
+			                        "SupportsPushdown");
+		}
+		result += MySQLUtils::WriteIdentifier(remove_info.removed_column.GetIdentifierName());
+		return result;
+	}
+	default:
+		throw InternalException("MySQLSQLWriter: unsupported ALTER table type - should have been blocked by "
 		                        "SupportsPushdown");
 	}
 }

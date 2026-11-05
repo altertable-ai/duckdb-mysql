@@ -8,6 +8,10 @@
 
 #pragma once
 
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/client_context.hpp"
+
 #include "storage/mysql_catalog_set.hpp"
 #include "storage/mysql_schema_entry.hpp"
 
@@ -16,13 +20,15 @@ struct CreateSchemaInfo;
 
 class MySQLSchemaSet : public MySQLCatalogSet {
 public:
-	explicit MySQLSchemaSet(Catalog &catalog);
+	explicit MySQLSchemaSet(Catalog &catalog, vector<string> schemas_to_load);
 
 public:
-	optional_ptr<CatalogEntry> CreateSchema(ClientContext &context, CreateSchemaInfo &info);
+	optional_ptr<CatalogEntry> CreateSchema(MySQLTransaction &transaction, CreateSchemaInfo &info);
 
 protected:
-	void LoadEntries(ClientContext &context) override;
+	void LoadEntries(MySQLTransaction &transaction) override;
+
+	vector<string> schemas_to_load;
 };
 
 } // namespace duckdb

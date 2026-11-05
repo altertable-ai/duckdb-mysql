@@ -1,10 +1,16 @@
 #include "mysql_types.hpp"
 
+#include "duckdb.hpp"
+#include "duckdb/catalog/default/default_types.hpp"
+#include "duckdb/common/logical_type_info.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+
 namespace duckdb {
 
 static bool GetBoolOption(ClientContext &context, const std::string &opt_name) {
 	Value val;
-	if (context.TryGetCurrentSetting(opt_name, val)) {
+	if (context.TryGetCurrentSetting(Identifier(opt_name), val)) {
 		return BooleanValue::Get(val);
 	}
 	return false;
@@ -139,7 +145,14 @@ LogicalType MySQLTypes::FieldToLogicalType(const MySQLTypeConfig &type_config, M
 		break;
 	case MYSQL_TYPE_DECIMAL:
 	case MYSQL_TYPE_NEWDECIMAL:
-		type_data.precision = int64_t(field->length) - 2; // -2 for minus sign and dot
+		// display length includes the dot only when scale > 0 and the minus sign only for signed types
+		type_data.precision = int64_t(field->length);
+		if (field->decimals > 0) {
+			type_data.precision--;
+		}
+		if (!(field->flags & UNSIGNED_FLAG)) {
+			type_data.precision--;
+		}
 		type_data.scale = field->decimals;
 		type_data.type_name = "decimal";
 		break;
@@ -221,7 +234,9 @@ LogicalType MySQLTypes::ToMySQLType(const MySQLTypeConfig &type_config, const Lo
 	case LogicalTypeId::VARCHAR:
 		return input;
 	case LogicalTypeId::TIME:
-		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
+	case LogicalTypeId::TIME_NS:
+		return type_config.time_as_time ? input : LogicalType::VARCHAR;
+	case LogicalTypeId::ARRAY:
 	case LogicalTypeId::LIST:
 		throw NotImplementedException("MySQL does not support arrays - unsupported type \"%s\"", input.ToString());
 	case LogicalTypeId::STRUCT:
@@ -254,12 +269,92 @@ string MySQLTypes::TypeToString(const LogicalType &input) {
 	case LogicalType::UBIGINT:
 		return "BIGINT UNSIGNED";
 	case LogicalType::TIMESTAMP:
-		return "DATETIME";
+		// without an explicit precision MySQL uses DATETIME(0) and rounds fractional seconds
+		return "DATETIME(6)";
 	case LogicalType::TIMESTAMP_TZ:
-		return "TIMESTAMP";
+		return "TIMESTAMP(6)";
 	default:
 		return input.ToString();
 	}
+}
+
+LogicalType MySQLTypes::ToLogicalType(optional_ptr<ParsedExpression> type_expr_ptr) {
+	if (!type_expr_ptr) {
+		throw InvalidInputException("MySQLTypes::ToLogicalType: null type expression specified");
+	}
+	if (type_expr_ptr->GetExpressionType() != ExpressionType::TYPE) {
+		throw InvalidInputException("MySQLTypes::ToLogicalType: unable to extract type name from expression: \"%s\"",
+		                            type_expr_ptr->ToString());
+	}
+	const TypeExpression &type_expr = type_expr_ptr->Cast<TypeExpression>();
+	return ToLogicalType(type_expr);
+}
+
+static uint8_t ExtractTinyIntValue(const ParsedExpression *parsed_expr) {
+	if (!parsed_expr) {
+		throw InvalidInputException("MySQLTypes::ToLogicalType: empty DECIMAL type modifier expression");
+	}
+	if (parsed_expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+		throw InvalidInputException(
+		    "MySQLTypes::ToLogicalType: DECIMAL type modifier must be a constant value, expression: \"%s\"",
+		    parsed_expr->ToString());
+	}
+	const ConstantExpression &const_expr = parsed_expr->Cast<ConstantExpression>();
+	Value const_val = const_expr.GetLiteral().ToValue();
+	string cast_err;
+	std::optional<Value> int_val = const_val.DefaultTryCastAs(LogicalType::TINYINT, &cast_err, true);
+	if (!int_val.has_value()) {
+		throw InvalidInputException(
+		    "MySQLTypes::ToLogicalType: DECIMAL type modifier must be a TINYINT, expression: \"%s\"",
+		    parsed_expr->ToString());
+	}
+	return TinyIntValue::Get(int_val.value());
+}
+
+static string ExtractVarcharCollation(const ParsedExpression *parsed_expr) {
+	if (!parsed_expr) {
+		throw InvalidInputException("MySQLTypes::ToLogicalType: empty VARCHAR collation expression");
+	}
+	if (parsed_expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+		throw InvalidInputException(
+		    "MySQLTypes::ToLogicalType: VARCHAR collation must be a constant value, expression: \"%s\"",
+		    parsed_expr->ToString());
+	}
+	const ConstantExpression &const_expr = parsed_expr->Cast<ConstantExpression>();
+	Value const_val = const_expr.GetLiteral().ToValue();
+	if (const_val.type().id() == LogicalTypeId::VARCHAR) {
+		return StringValue::Get(const_val);
+	}
+	return string();
+}
+
+LogicalType MySQLTypes::ToLogicalType(const TypeExpression &type_expr) {
+	const Identifier &type_name = type_expr.GetTypeName();
+	// pure map lookup, no other logic is inside, map can be moved to extension if needed
+	LogicalTypeId type_id = DefaultTypeGenerator::GetDefaultType(type_name);
+	if (type_id == LogicalTypeId::INVALID) {
+		throw InvalidInputException("MySQLTypes::ToLogicalType: invalid type expression: \"%s\"", type_expr.ToString());
+	}
+	if (type_id == LogicalTypeId::DECIMAL) {
+		const vector<unique_ptr<ParsedExpression>> &children = type_expr.GetChildren();
+		unique_ptr<DecimalTypeInfo> type_info = make_uniq<DecimalTypeInfo>(18, 3);
+		if (children.size() > 0) {
+			type_info->width = ExtractTinyIntValue(children[0].get());
+		}
+		if (children.size() > 1) {
+			type_info->scale = ExtractTinyIntValue(children[1].get());
+		}
+		return LogicalType(type_id, std::move(type_info));
+	}
+	if (type_id == LogicalType::VARCHAR) {
+		const vector<unique_ptr<ParsedExpression>> &children = type_expr.GetChildren();
+		unique_ptr<StringTypeInfo> type_info = make_uniq<StringTypeInfo>("");
+		if (children.size() > 0) {
+			type_info->collation = ExtractVarcharCollation(children[0].get());
+		}
+		return LogicalType(type_id, std::move(type_info));
+	}
+	return LogicalType(type_id);
 }
 
 } // namespace duckdb

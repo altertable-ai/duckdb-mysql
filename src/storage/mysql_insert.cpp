@@ -1,27 +1,30 @@
 #include "storage/mysql_insert.hpp"
 
-#include "duckdb/planner/operator/logical_insert.hpp"
-#include "duckdb/planner/operator/logical_create_table.hpp"
-#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 #include "mysql_connection.hpp"
-#include "mysql_scanner.hpp"
 #include "mysql_types.hpp"
-
 #include "storage/mysql_catalog.hpp"
-#include "storage/mysql_transaction.hpp"
 #include "storage/mysql_table_entry.hpp"
+#include "storage/mysql_transaction.hpp"
 
 namespace duckdb {
 
 MySQLInsert::MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
-                         physical_index_vector_t<idx_t> column_index_map_p)
+                         unordered_set<idx_t> unspecified_columns_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(&table), schema(nullptr),
-      column_index_map(std::move(column_index_map_p)) {
+      unspecified_columns(std::move(unspecified_columns_p)) {
 }
 
 MySQLInsert::MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
@@ -46,29 +49,30 @@ public:
 	idx_t insert_count;
 	string base_insert_query;
 	string insert_values;
+	//! Indexes of the input columns that are written into the VALUES list
+	vector<idx_t> value_columns;
+	//! Indexes of the input columns that map to MySQL generated columns, these are not written
+	vector<idx_t> generated_columns;
+	//! For each entry in value_columns, whether NULL values are written as DEFAULT
+	vector<bool> use_default;
 };
 
-vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entry) {
+vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entry, MySQLInsertGlobalState &gstate) {
 	vector<string> column_names;
 	auto &columns = entry.GetColumns();
-	idx_t column_count;
-	if (!insert.column_index_map.empty()) {
-		column_count = 0;
-		vector<PhysicalIndex> column_indexes;
-		column_indexes.resize(columns.LogicalColumnCount(), PhysicalIndex(DConstants::INVALID_INDEX));
-		for (idx_t c = 0; c < insert.column_index_map.size(); c++) {
-			auto column_index = PhysicalIndex(c);
-			auto mapped_index = insert.column_index_map[column_index];
-			if (mapped_index == DConstants::INVALID_INDEX) {
-				// column not specified
-				continue;
-			}
-			column_indexes[mapped_index] = column_index;
-			column_count++;
+	// the input contains all physical columns of the table (with NULLs filled in for unspecified columns),
+	// skip the unspecified columns so MySQL applies their defaults, and skip the MySQL generated columns
+	// as MySQL does not allow inserting into them, NULL values of the columns with defaults are written as DEFAULT
+	for (auto &col : columns.Physical()) {
+		if (insert.unspecified_columns.count(col.Physical().index) > 0) {
+			continue;
 		}
-		for (idx_t c = 0; c < column_count; c++) {
-			auto &col = columns.GetColumn(column_indexes[c]);
-			column_names.push_back(col.GetName());
+		if (entry.IsGeneratedColumn(col.Logical())) {
+			gstate.generated_columns.push_back(col.Physical().index);
+		} else {
+			column_names.emplace_back(col.GetName().GetIdentifierName());
+			gstate.value_columns.push_back(col.Physical().index);
+			gstate.use_default.push_back(entry.HasDefaultValue(col.Logical()));
 		}
 	}
 	return column_names;
@@ -77,9 +81,9 @@ vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entr
 string GetBaseInsertQuery(const MySQLTableEntry &table, const vector<string> &column_names) {
 	string query;
 	query += "INSERT INTO ";
-	query += MySQLUtils::WriteIdentifier(table.schema.name);
+	query += MySQLUtils::WriteIdentifier(table.schema.name.GetIdentifierName());
 	query += ".";
-	query += MySQLUtils::WriteIdentifier(table.name);
+	query += MySQLUtils::WriteIdentifier(table.name.GetIdentifierName());
 	query += " ";
 	if (!column_names.empty()) {
 		query += "(";
@@ -104,14 +108,10 @@ unique_ptr<GlobalSinkState> MySQLInsert::GetGlobalSinkState(ClientContext &conte
 	} else {
 		insert_table = &table.get_mutable()->Cast<MySQLTableEntry>();
 	}
-	auto insert_columns = GetInsertColumns(*this, *insert_table);
-	vector<LogicalType> insert_types;
-	idx_t insert_column_count =
-	    insert_columns.empty() ? insert_table->GetColumns().LogicalColumnCount() : insert_columns.size();
-	for (idx_t c = 0; c < insert_column_count; c++) {
-		insert_types.push_back(LogicalType::VARCHAR);
-	}
-	auto result = make_uniq<MySQLInsertGlobalState>(context, *insert_table, insert_types);
+	auto &child_types = children[0].get().GetTypes();
+	vector<LogicalType> varchar_types(child_types.size(), LogicalType::VARCHAR);
+	auto result = make_uniq<MySQLInsertGlobalState>(context, *insert_table, varchar_types);
+	auto insert_columns = GetInsertColumns(*this, *insert_table, *result);
 	result->base_insert_query = GetBaseInsertQuery(*insert_table, insert_columns);
 	return std::move(result);
 }
@@ -199,18 +199,30 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 		add_quotes.push_back(add_quotes_for_type);
 	}
 
+	// values for generated columns can only be NULL (i.e. the column was not specified)
+	for (auto c : gstate.generated_columns) {
+		for (idx_t r = 0; r < chunk.size(); r++) {
+			if (!FlatVector::IsNull(chunk.data[c], r)) {
+				auto &col = gstate.table.GetColumns().GetColumn(PhysicalIndex(c));
+				throw InvalidInputException("Cannot insert into a generated column \"%s\"",
+				                            col.GetName().GetIdentifierName());
+			}
+		}
+	}
+
 	// generate INSERT INTO statements
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		if (!gstate.insert_values.empty()) {
 			gstate.insert_values += ", ";
 		}
 		gstate.insert_values += "(";
-		for (idx_t c = 0; c < gstate.varchar_chunk.ColumnCount(); c++) {
-			if (c > 0) {
+		for (idx_t i = 0; i < gstate.value_columns.size(); i++) {
+			auto c = gstate.value_columns[i];
+			if (i > 0) {
 				gstate.insert_values += ", ";
 			}
 			if (FlatVector::IsNull(gstate.varchar_chunk.data[c], r)) {
-				gstate.insert_values += "NULL";
+				gstate.insert_values += gstate.use_default[i] ? "DEFAULT" : "NULL";
 			} else {
 				auto data = FlatVector::GetDataMutable<string_t>(gstate.varchar_chunk.data[c]);
 				if (add_quotes[c]) {
@@ -223,7 +235,7 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 		gstate.insert_values += ")";
 		if (gstate.insert_values.size() >= INSERT_FLUSH_SIZE) {
 			// perform the actual insert
-			con.Execute(gstate.base_insert_query + gstate.insert_values);
+			con.Execute(context.client, gstate.base_insert_query + gstate.insert_values);
 			// reset the to-be-inserted values
 			gstate.insert_values = string();
 		}
@@ -242,7 +254,7 @@ SinkFinalizeType MySQLInsert::Finalize(Pipeline &pipeline, Event &event, ClientC
 		// perform the final insert
 		auto &transaction = MySQLTransaction::Get(context, gstate.table.catalog);
 		auto &con = transaction.GetConnection();
-		con.Execute(gstate.base_insert_query + gstate.insert_values);
+		con.Execute(context, gstate.base_insert_query + gstate.insert_values);
 	}
 	return SinkFinalizeType::READY;
 }
@@ -268,7 +280,7 @@ string MySQLInsert::GetName() const {
 
 InsertionOrderPreservingMap<string> MySQLInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table Name"] = table ? table->name : info->Base().table;
+	result["Table Name"] = table ? table->name.GetIdentifierName() : info->Base().GetTableName().GetIdentifierName();
 	return result;
 }
 
@@ -322,15 +334,27 @@ PhysicalOperator &MySQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanG
 		throw BinderException("ON CONFLICT clause not yet supported for insertion into MySQL table");
 	}
 
-	D_ASSERT(plan);
+	if (!plan) {
+		throw InternalException("MySQLCatalog::PlanInsert: insert without a child plan");
+	}
+	MySQLCatalog::MaterializeMySQLScans(*plan);
+	// the binder moves the default expressions of the columns not specified in the INSERT into the input projection
+	unordered_set<idx_t> unspecified_columns;
+	for (auto &col : op.table.GetColumns().Physical()) {
+		auto storage_idx = col.StorageOid();
+		if (storage_idx < op.bound_defaults.size() && !op.bound_defaults[storage_idx]) {
+			unspecified_columns.insert(col.Physical().index);
+		}
+	}
 	auto &inner_plan = AddCastToMySQLTypes(context, planner, *plan);
-	auto &insert = planner.Make<MySQLInsert>(op, op.table, op.column_index_map);
+	auto &insert = planner.Make<MySQLInsert>(op, op.table, std::move(unspecified_columns));
 	insert.children.push_back(inner_plan);
 	return insert;
 }
 
 PhysicalOperator &MySQLCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                   LogicalCreateTable &op, PhysicalOperator &plan) {
+	MySQLCatalog::MaterializeMySQLScans(plan);
 	auto &inner_plan = AddCastToMySQLTypes(context, planner, plan);
 	auto &insert = planner.Make<MySQLInsert>(op, op.schema, std::move(op.info));
 	insert.children.push_back(inner_plan);

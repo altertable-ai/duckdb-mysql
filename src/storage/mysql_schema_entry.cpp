@@ -1,16 +1,21 @@
 #include "storage/mysql_schema_entry.hpp"
-#include "storage/mysql_table_entry.hpp"
-#include "storage/mysql_transaction.hpp"
-#include "duckdb/parser/parsed_data/create_view_info.hpp"
-#include "duckdb/parser/parsed_data/create_index_info.hpp"
-#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
-#include "duckdb/parser/parsed_data/drop_info.hpp"
+
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/constraints/list.hpp"
-#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+
+#include "storage/mysql_transaction.hpp"
 
 namespace duckdb {
 
@@ -28,7 +33,7 @@ MySQLTransaction &GetMySQLTransaction(CatalogTransaction transaction) {
 void MySQLSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name) {
 	DropInfo info;
 	info.type = catalog_type;
-	info.name = name;
+	info.SetName(Identifier(name));
 	info.cascade = false;
 	info.if_not_found = OnEntryNotFound::RETURN_NULL;
 	DropEntry(context, info);
@@ -36,12 +41,13 @@ void MySQLSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_
 
 optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	auto &base_info = info.Base();
-	auto table_name = base_info.table;
+	auto table_name = base_info.GetTableName();
 	if (base_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		// CREATE OR REPLACE - drop any existing entries first (if any)
-		TryDropEntry(transaction.GetContext(), CatalogType::TABLE_ENTRY, table_name);
+		TryDropEntry(transaction.GetContext(), CatalogType::TABLE_ENTRY, table_name.GetIdentifierName());
 	}
-	return tables.CreateTable(transaction.GetContext(), info);
+	auto &mysql_transaction = GetMySQLTransaction(transaction);
+	return tables.CreateTable(mysql_transaction, info);
 }
 
 optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
@@ -66,9 +72,9 @@ string GetMySQLCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
 		sql += " UNIQUE";
 	}
 	sql += " INDEX ";
-	sql += MySQLUtils::WriteIdentifier(info.index_name);
+	sql += MySQLUtils::WriteIdentifier(info.GetIndexName().GetIdentifierName());
 	sql += " ON ";
-	sql += MySQLUtils::WriteIdentifier(tbl.name);
+	sql += MySQLUtils::WriteIdentifier(tbl.name.GetIdentifierName());
 	sql += "(";
 	for (idx_t i = 0; i < info.parsed_expressions.size(); i++) {
 		if (i > 0) {
@@ -91,14 +97,14 @@ string GetMySQLCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
 optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
                                                          TableCatalogEntry &table) {
 	auto &mysql_transaction = MySQLTransaction::Get(transaction.GetContext(), table.catalog);
-	mysql_transaction.Query(GetMySQLCreateIndex(info, table));
+	mysql_transaction.GetConnection().Execute(transaction.GetContext(), GetMySQLCreateIndex(info, table));
 	return nullptr;
 }
 
 string GetMySQLCreateView(CreateViewInfo &info) {
 	string sql;
 	sql = "CREATE VIEW ";
-	sql += MySQLUtils::WriteIdentifier(info.view_name);
+	sql += MySQLUtils::WriteIdentifier(info.GetViewName().GetIdentifierName());
 	sql += " ";
 	if (!info.aliases.empty()) {
 		sql += "(";
@@ -107,7 +113,7 @@ string GetMySQLCreateView(CreateViewInfo &info) {
 				sql += ", ";
 			}
 			auto &alias = info.aliases[i];
-			sql += MySQLUtils::WriteIdentifier(alias);
+			sql += MySQLUtils::WriteIdentifier(alias.GetIdentifierName());
 		}
 		sql += ") ";
 	}
@@ -123,18 +129,18 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateView(CatalogTransaction trans
 	}
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT ||
 	    info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-		auto current_entry = GetEntry(transaction, CatalogType::VIEW_ENTRY, info.view_name);
+		auto current_entry = GetEntry(transaction, CatalogType::VIEW_ENTRY, info.GetViewName());
 		if (current_entry) {
 			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 				return current_entry;
 			}
 			// CREATE OR REPLACE - drop any existing entries first (if any)
-			TryDropEntry(transaction.GetContext(), CatalogType::VIEW_ENTRY, info.view_name);
+			TryDropEntry(transaction.GetContext(), CatalogType::VIEW_ENTRY, info.GetViewName().GetIdentifierName());
 		}
 	}
 	auto &mysql_transaction = GetMySQLTransaction(transaction);
-	mysql_transaction.Query(GetMySQLCreateView(info));
-	return tables.RefreshTable(transaction.GetContext(), info.view_name);
+	mysql_transaction.GetConnection().Execute(transaction.GetContext(), GetMySQLCreateView(info));
+	return tables.RefreshTable(mysql_transaction, info.GetViewName().GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
@@ -170,7 +176,8 @@ void MySQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		throw BinderException("Only altering tables is supported for now");
 	}
 	auto &alter = info.Cast<AlterTableInfo>();
-	tables.AlterTable(transaction.GetContext(), alter);
+	auto &mysql_transaction = GetMySQLTransaction(transaction);
+	tables.AlterTable(mysql_transaction, alter);
 }
 
 bool CatalogTypeIsSupported(CatalogType type) {
@@ -189,14 +196,16 @@ void MySQLSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	if (!CatalogTypeIsSupported(type)) {
 		return;
 	}
-	GetCatalogSet(type).Scan(context, callback);
+	auto &transaction = MySQLTransaction::Get(context, catalog);
+	GetCatalogSet(type).Scan(transaction, callback);
 }
 void MySQLSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 	throw NotImplementedException("Scan without context not supported");
 }
 
 void MySQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	GetCatalogSet(info.type).DropEntry(context, info);
+	auto &transaction = MySQLTransaction::Get(context, catalog);
+	GetCatalogSet(info.type).DropEntry(transaction, info);
 }
 
 optional_ptr<CatalogEntry> MySQLSchemaEntry::LookupEntry(CatalogTransaction transaction,
@@ -205,7 +214,8 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::LookupEntry(CatalogTransaction tran
 	if (!CatalogTypeIsSupported(lookup_type)) {
 		return nullptr;
 	}
-	return GetCatalogSet(lookup_type).GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
+	auto &mysql_transaction = GetMySQLTransaction(transaction);
+	return GetCatalogSet(lookup_type).GetEntry(mysql_transaction, lookup_info.GetEntryName());
 }
 
 MySQLCatalogSet &MySQLSchemaEntry::GetCatalogSet(CatalogType type) {

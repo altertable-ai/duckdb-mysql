@@ -7,10 +7,15 @@
 
 #pragma once
 
+#include "duckdb.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/tableref.hpp"
 
@@ -49,11 +54,16 @@ public:
 	MySQLSQLWriter(ClientContext &context, const MySQLVersion &version);
 
 	//! Convert a query node to a MySQL-compatible SQL string
-	static string MySQLToString(ClientContext &context, const MySQLVersion &version, const QueryNode &node);
+	static vector<string> ToStatements(ClientContext &context, const MySQLVersion &version, const QueryNode &node);
+	//! Convert a statement to a MySQL-compatible SQL string
+	static vector<string> ToStatements(ClientContext &context, const MySQLVersion &version,
+	                                   const SQLStatement &statement);
 
 private:
 	string WriteQueryNode(const QueryNode &node);
 	string WriteSelectNode(const SelectNode &node);
+	string WriteUpdateNode(const UpdateQueryNode &node);
+	string WriteDeleteNode(const DeleteQueryNode &node);
 	string WriteSetOperationNode(const SetOperationNode &node);
 	string WriteRecursiveCTENode(const RecursiveCTENode &node);
 	string WriteCTEMap(const CommonTableExpressionMap &cte_map);
@@ -77,6 +87,18 @@ private:
 	string WriteConstant(const Value &value);
 	string WriteCastType(const LogicalType &type);
 	string WriteIdentifier(const string &identifier);
+
+	vector<string> WriteStatement(const SQLStatement &statement);
+	vector<string> WriteCreateStatement(const CreateInfo &info);
+	vector<string> WriteCreateTableStatement(const CreateTableInfo &info);
+
+	string WriteDropStatement(const DropInfo &info);
+	string WriteDropTableStatement(const DropInfo &info);
+
+	string WriteAlterStatement(const AlterInfo &info);
+	string WriteAlterTableStatement(const AlterTableInfo &info);
+
+	string WriteQualifiedName(const QualifiedName &name);
 
 private:
 	ClientContext &context;

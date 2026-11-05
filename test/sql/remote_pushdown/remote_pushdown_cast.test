@@ -57,6 +57,21 @@ explain SELECT SUM(CAST(i AS DOUBLE)) FROM s.small_tbl
 ----
 physical_plan	<!REGEX>:.*AGGREGATE.*
 
+statement error
+SELECT SUM(CAST(i AS DECIMAL('foo'))) FROM s.small_tbl
+----
+DECIMAL type modifier must be a TINYINT
+
+query I
+SELECT SUM(CAST(i AS DECIMAL)) FROM s.small_tbl
+----
+45.00
+
+query I
+SELECT SUM(CAST(i AS DECIMAL(18))) FROM s.small_tbl
+----
+45.00
+
 query I
 SELECT SUM(CAST(i AS DECIMAL(8,2))) FROM s.small_tbl
 ----
@@ -89,4 +104,4 @@ SELECT COUNT(CAST(d AS BLOB)) FROM s.small_tbl
 query II
 explain SELECT COUNT(CAST(d AS BLOB)) FROM s.small_tbl
 ----
-physical_plan	<REGEX>:.*AGGREGATE.*
+physical_plan	<REGEX>:.*Aggregate.*
